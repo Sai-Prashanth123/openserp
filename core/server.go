@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/sirupsen/logrus"
@@ -24,14 +27,62 @@ type Server struct {
 	app           *fiber.App
 	addr          string
 	searchEngines []SearchEngine
+	cache         *ResponseCache
+	startTime     time.Time
+}
+
+// ServerOptions holds optional configuration for the HTTP server
+type ServerOptions struct {
+	CacheTTL     time.Duration // How long to cache search results (0 = disabled)
+	CacheMaxSize int           // Maximum number of cached entries
+	EnableCORS   bool          // Enable CORS headers for browser clients
+}
+
+// DefaultServerOptions returns sensible defaults for production use
+func DefaultServerOptions() ServerOptions {
+	return ServerOptions{
+		CacheTTL:     5 * time.Minute,
+		CacheMaxSize: 1000,
+		EnableCORS:   true,
+	}
 }
 
 func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
+	return NewServerWithOptions(host, port, DefaultServerOptions(), searchEngines...)
+}
+
+func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngines ...SearchEngine) *Server {
 	addr := fmt.Sprintf("%s:%d", host, port)
+
+	app := fiber.New(fiber.Config{
+		ErrorHandler: JSONErrorMiddleware(),
+	})
+
 	serv := Server{
-		app:           fiber.New(),
+		app:           app,
 		addr:          addr,
 		searchEngines: searchEngines,
+		startTime:     time.Now(),
+	}
+
+	// Initialize cache if TTL > 0
+	if opts.CacheTTL > 0 {
+		serv.cache = NewResponseCache(opts.CacheTTL, opts.CacheMaxSize)
+		logrus.Infof("Response cache enabled: TTL=%s, MaxSize=%d", opts.CacheTTL, opts.CacheMaxSize)
+	}
+
+	// Apply middleware
+	if opts.EnableCORS {
+		app.Use(CORSMiddleware(DefaultCORSConfig()))
+	}
+	app.Use(RequestLoggerMiddleware())
+
+	// Health check endpoint — for Docker, load balancers, and monitoring
+	app.Get("/health", serv.handleHealthCheck)
+
+	// Cache stats endpoint
+	if serv.cache != nil {
+		app.Get("/cache/stats", serv.handleCacheStats)
 	}
 
 	for _, engine := range searchEngines {
@@ -54,6 +105,17 @@ func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
 
 			logrus.Infof("Starting SERP search request using %s engine for query: %s", locEngine.Name(), q.Text)
 
+			// Check cache first
+			if serv.cache != nil {
+				cacheKey := BuildCacheKey(locEngine.Name()+"/search", q)
+				if cached, ok := serv.cache.Get(cacheKey); ok {
+					logrus.Infof("Cache hit for %s search: %s", locEngine.Name(), q.Text)
+					c.Set("Content-Type", "application/json")
+					c.Set("X-Cache", "HIT")
+					return c.Send(cached)
+				}
+			}
+
 			err = limiter.Wait(context.Background())
 			if err != nil {
 				logrus.Errorf("Ratelimiter error during %s query: %s", locEngine.Name(), err)
@@ -72,7 +134,16 @@ func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
 				return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
 			}
 
+			// Store in cache
+			if serv.cache != nil && len(res) > 0 {
+				cacheKey := BuildCacheKey(locEngine.Name()+"/search", q)
+				if data, err := json.Marshal(res); err == nil {
+					serv.cache.Set(cacheKey, data)
+				}
+			}
+
 			logrus.Infof("Successfully completed SERP search using %s engine, returned %d results", locEngine.Name(), len(res))
+			c.Set("X-Cache", "MISS")
 			return c.JSON(res)
 		})
 
@@ -85,6 +156,17 @@ func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
 			}
 
 			logrus.Infof("Starting SERP image search request using %s engine for query: %s", locEngine.Name(), q.Text)
+
+			// Check cache first
+			if serv.cache != nil {
+				cacheKey := BuildCacheKey(locEngine.Name()+"/image", q)
+				if cached, ok := serv.cache.Get(cacheKey); ok {
+					logrus.Infof("Cache hit for %s image search: %s", locEngine.Name(), q.Text)
+					c.Set("Content-Type", "application/json")
+					c.Set("X-Cache", "HIT")
+					return c.Send(cached)
+				}
+			}
 
 			err = limiter.Wait(context.Background())
 			if err != nil {
@@ -111,7 +193,16 @@ func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
 				return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
 			}
 
+			// Store in cache
+			if serv.cache != nil && len(res) > 0 {
+				cacheKey := BuildCacheKey(locEngine.Name()+"/image", q)
+				if data, err := json.Marshal(res); err == nil {
+					serv.cache.Set(cacheKey, data)
+				}
+			}
+
 			logrus.Infof("Successfully completed SERP image search using [%s], returned %d results", locEngine.Name(), len(res))
+			c.Set("X-Cache", "MISS")
 			return c.JSON(res)
 		})
 	}
@@ -126,6 +217,69 @@ func NewServer(host string, port int, searchEngines ...SearchEngine) *Server {
 	serv.app.Get("/mega/engines", serv.handleListEngines)
 
 	return &serv
+}
+
+// HealthStatus represents the response from the /health endpoint
+type HealthStatus struct {
+	Status  string                 `json:"status"`
+	Uptime  string                 `json:"uptime"`
+	Engines []EngineHealth         `json:"engines"`
+	System  map[string]interface{} `json:"system"`
+}
+
+// EngineHealth shows the status of an individual search engine
+type EngineHealth struct {
+	Name        string `json:"name"`
+	Initialized bool   `json:"initialized"`
+	Status      string `json:"status"`
+}
+
+// handleHealthCheck reports server health, engine status, and uptime.
+// Use this for Docker HEALTHCHECK, Kubernetes probes, or monitoring dashboards.
+func (s *Server) handleHealthCheck(c *fiber.Ctx) error {
+	overallStatus := "healthy"
+
+	engines := make([]EngineHealth, 0, len(s.searchEngines))
+	for _, engine := range s.searchEngines {
+		status := "ready"
+		if !engine.IsInitialized() {
+			status = "not_initialized"
+			overallStatus = "degraded"
+		}
+		engines = append(engines, EngineHealth{
+			Name:        engine.Name(),
+			Initialized: engine.IsInitialized(),
+			Status:      status,
+		})
+	}
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	health := HealthStatus{
+		Status:  overallStatus,
+		Uptime:  time.Since(s.startTime).Round(time.Second).String(),
+		Engines: engines,
+		System: map[string]interface{}{
+			"goroutines":  runtime.NumGoroutine(),
+			"memory_mb":   memStats.Alloc / 1024 / 1024,
+			"go_version":  runtime.Version(),
+		},
+	}
+
+	if overallStatus != "healthy" {
+		c.Status(fiber.StatusServiceUnavailable)
+	}
+
+	return c.JSON(health)
+}
+
+// handleCacheStats returns current cache statistics
+func (s *Server) handleCacheStats(c *fiber.Ctx) error {
+	if s.cache == nil {
+		return c.JSON(map[string]string{"status": "disabled"})
+	}
+	return c.JSON(s.cache.Stats())
 }
 
 // MegaSearchResult represents a search result with engine information

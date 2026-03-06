@@ -9,6 +9,9 @@ app:
   leave_head: false
   stealth: false
   insecure: true
+  cache_ttl: 300        # Cache TTL in seconds (0 to disable)
+  cache_max_size: 1000  # Maximum number of cached responses
+  cors: true            # Enable CORS headers for browser clients
 
 2captcha:
   apikey: "123123123123123"

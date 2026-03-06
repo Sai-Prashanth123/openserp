@@ -101,7 +101,13 @@ func serve(cmd *cobra.Command, args []string) {
 	bing := bing.New(*browser, config.BingConfig)
 	ddg := duckduckgo.New(*browser, config.DuckDuckGoConfig)
 
-	serv := core.NewServer(config.App.Host, config.App.Port, gogl, yand, baidu, bing, ddg)
+	serverOpts := core.ServerOptions{
+		CacheTTL:     time.Duration(config.App.CacheTTL) * time.Second,
+		CacheMaxSize: config.App.CacheMaxSize,
+		EnableCORS:   config.App.EnableCORS,
+	}
+
+	serv := core.NewServerWithOptions(config.App.Host, config.App.Port, serverOpts, gogl, yand, baidu, bing, ddg)
 
 	err = serv.Listen()
 	if err != nil {

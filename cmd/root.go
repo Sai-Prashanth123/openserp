@@ -46,6 +46,9 @@ type AppConfig struct {
 	ProxyURL      string `mapstructure:"proxy"`
 	Insecure      bool   `mapstructure:"insecure"`
 	IsStealth     bool   `mapstructure:"stealth"`
+	CacheTTL      int    `mapstructure:"cache_ttl"`      // Cache TTL in seconds (0 = disabled)
+	CacheMaxSize  int    `mapstructure:"cache_max_size"` // Max number of cached responses
+	EnableCORS    bool   `mapstructure:"cors"`           // Enable CORS headers
 }
 
 var config = Config{}
@@ -173,4 +176,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVarP(&config.App.ProxyURL, "proxy", "x", "", "HTTP or Socks5 proxy URL (e.g. http://user:pass@127.0.0.1:8080)")
 	RootCmd.PersistentFlags().BoolVarP(&config.App.IsStealth, "stealth", "s", false, "Use stealth browser plugin")
 	RootCmd.PersistentFlags().BoolVarP(&config.App.Insecure, "insecure", "k", false, "Allow insecure TLS connections")
+	RootCmd.PersistentFlags().IntVar(&config.App.CacheTTL, "cache_ttl", 300, "Cache TTL in seconds (0 to disable)")
+	RootCmd.PersistentFlags().IntVar(&config.App.CacheMaxSize, "cache_max_size", 1000, "Maximum number of cached responses")
+	RootCmd.PersistentFlags().BoolVar(&config.App.EnableCORS, "cors", true, "Enable CORS headers for browser clients")
 }
