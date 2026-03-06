@@ -105,6 +105,20 @@ func serve(cmd *cobra.Command, args []string) {
 		CacheTTL:     time.Duration(config.App.CacheTTL) * time.Second,
 		CacheMaxSize: config.App.CacheMaxSize,
 		EnableCORS:   config.App.EnableCORS,
+		Resilience: core.ResilientConfig{
+			Retry: core.RetryConfig{
+				MaxRetries:     config.App.MaxRetries,
+				InitialBackoff: 1 * time.Second,
+				MaxBackoff:     30 * time.Second,
+				BackoffFactor:  2.0,
+			},
+			CircuitBreaker: core.CircuitBreakerConfig{
+				FailureThreshold: config.App.CBFailures,
+				RecoveryTimeout:  time.Duration(config.App.CBRecovery) * time.Second,
+				SuccessThreshold: 2,
+			},
+			ProxyURLs: config.App.ProxyList,
+		},
 	}
 
 	serv := core.NewServerWithOptions(config.App.Host, config.App.Port, serverOpts, gogl, yand, baidu, bing, ddg)

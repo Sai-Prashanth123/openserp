@@ -33,22 +33,26 @@ type Config2Captcha struct {
 }
 
 type AppConfig struct {
-	Host          string `mapstructure:"host"`
-	Port          int    `mapstructure:"port"`
-	Timeout       int    `mapstructure:"timeout"`
-	ConfigPath    string `mapstructure:"config_path"`
-	IsBrowserHead bool   `mapstructure:"head"`
-	IsLeaveHead   bool   `mapstructure:"leave_head"`
-	IsLeakless    bool   `mapstructure:"leakless"`
-	IsDebug       bool   `mapstructure:"debug"`
-	IsVerbose     bool   `mapstructure:"verbose"`
-	IsRawRequests bool   `mapstructure:"raw_requests"`
-	ProxyURL      string `mapstructure:"proxy"`
-	Insecure      bool   `mapstructure:"insecure"`
-	IsStealth     bool   `mapstructure:"stealth"`
-	CacheTTL      int    `mapstructure:"cache_ttl"`      // Cache TTL in seconds (0 = disabled)
-	CacheMaxSize  int    `mapstructure:"cache_max_size"` // Max number of cached responses
-	EnableCORS    bool   `mapstructure:"cors"`           // Enable CORS headers
+	Host          string   `mapstructure:"host"`
+	Port          int      `mapstructure:"port"`
+	Timeout       int      `mapstructure:"timeout"`
+	ConfigPath    string   `mapstructure:"config_path"`
+	IsBrowserHead bool     `mapstructure:"head"`
+	IsLeaveHead   bool     `mapstructure:"leave_head"`
+	IsLeakless    bool     `mapstructure:"leakless"`
+	IsDebug       bool     `mapstructure:"debug"`
+	IsVerbose     bool     `mapstructure:"verbose"`
+	IsRawRequests bool     `mapstructure:"raw_requests"`
+	ProxyURL      string   `mapstructure:"proxy"`
+	Insecure      bool     `mapstructure:"insecure"`
+	IsStealth     bool     `mapstructure:"stealth"`
+	CacheTTL      int      `mapstructure:"cache_ttl"`        // Cache TTL in seconds (0 = disabled)
+	CacheMaxSize  int      `mapstructure:"cache_max_size"`   // Max number of cached responses
+	EnableCORS    bool     `mapstructure:"cors"`             // Enable CORS headers
+	MaxRetries    int      `mapstructure:"max_retries"`      // Max retry attempts per engine (0 = disabled)
+	CBFailures    int      `mapstructure:"cb_failures"`      // Failures before circuit opens
+	CBRecovery    int      `mapstructure:"cb_recovery"`      // Seconds before retrying an open circuit
+	ProxyList     []string `mapstructure:"proxy_list"`       // List of proxy URLs for rotation
 }
 
 var config = Config{}
@@ -179,4 +183,7 @@ func init() {
 	RootCmd.PersistentFlags().IntVar(&config.App.CacheTTL, "cache_ttl", 300, "Cache TTL in seconds (0 to disable)")
 	RootCmd.PersistentFlags().IntVar(&config.App.CacheMaxSize, "cache_max_size", 1000, "Maximum number of cached responses")
 	RootCmd.PersistentFlags().BoolVar(&config.App.EnableCORS, "cors", true, "Enable CORS headers for browser clients")
+	RootCmd.PersistentFlags().IntVar(&config.App.MaxRetries, "max_retries", 3, "Max retry attempts per search engine (0 to disable)")
+	RootCmd.PersistentFlags().IntVar(&config.App.CBFailures, "cb_failures", 5, "Consecutive failures before circuit breaker opens")
+	RootCmd.PersistentFlags().IntVar(&config.App.CBRecovery, "cb_recovery", 60, "Seconds before retrying an engine with open circuit")
 }

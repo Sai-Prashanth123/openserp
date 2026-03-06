@@ -28,6 +28,7 @@ type Server struct {
 	addr          string
 	searchEngines []SearchEngine
 	cache         *ResponseCache
+	resilient     *ResilientSearcher
 	startTime     time.Time
 }
 
@@ -36,6 +37,7 @@ type ServerOptions struct {
 	CacheTTL     time.Duration // How long to cache search results (0 = disabled)
 	CacheMaxSize int           // Maximum number of cached entries
 	EnableCORS   bool          // Enable CORS headers for browser clients
+	Resilience   ResilientConfig // Retry, circuit breaker, proxy rotation settings
 }
 
 // DefaultServerOptions returns sensible defaults for production use
@@ -44,6 +46,7 @@ func DefaultServerOptions() ServerOptions {
 		CacheTTL:     5 * time.Minute,
 		CacheMaxSize: 1000,
 		EnableCORS:   true,
+		Resilience:   DefaultResilientConfig(),
 	}
 }
 
@@ -65,6 +68,10 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 		startTime:     time.Now(),
 	}
 
+	// Initialize resilient searcher (retry + circuit breaker + fallback)
+	serv.resilient = NewResilientSearcher(searchEngines, opts.Resilience)
+	logrus.Info("Resilient search enabled: retry + circuit breaker + engine fallback")
+
 	// Initialize cache if TTL > 0
 	if opts.CacheTTL > 0 {
 		serv.cache = NewResponseCache(opts.CacheTTL, opts.CacheMaxSize)
@@ -84,6 +91,9 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 	if serv.cache != nil {
 		app.Get("/cache/stats", serv.handleCacheStats)
 	}
+
+	// Circuit breaker stats endpoint
+	app.Get("/resilience/stats", serv.handleResilienceStats)
 
 	for _, engine := range searchEngines {
 		locEngine := engine
@@ -121,17 +131,11 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 				logrus.Errorf("Ratelimiter error during %s query: %s", locEngine.Name(), err)
 			}
 
-			res, err := locEngine.Search(q)
-			if err != nil {
-				switch err {
-				case ErrCaptcha:
-					err = fmt.Errorf("captcha found, please stop sending requests for a while\n%s", err)
-				case ErrSearchTimeout:
-					err = fmt.Errorf("%s", err)
-				}
-
-				logrus.Errorf("Error during %s search: %s", locEngine.Name(), err)
-				return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
+			// Use resilient search: retry + circuit breaker + engine fallback
+			res, usedEngine, searchErr := serv.resilient.Search(locEngine, q)
+			if searchErr != nil {
+				logrus.Errorf("Error during resilient %s search: %s", locEngine.Name(), searchErr)
+				return fiber.NewError(fiber.StatusServiceUnavailable, searchErr.Error())
 			}
 
 			// Store in cache
@@ -142,7 +146,13 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 				}
 			}
 
-			logrus.Infof("Successfully completed SERP search using %s engine, returned %d results", locEngine.Name(), len(res))
+			// Report which engine actually served the results
+			if usedEngine != locEngine.Name() {
+				c.Set("X-Fallback-Engine", usedEngine)
+				logrus.Infof("Request for %s was served by fallback engine: %s (%d results)", locEngine.Name(), usedEngine, len(res))
+			} else {
+				logrus.Infof("Successfully completed SERP search using %s engine, returned %d results", locEngine.Name(), len(res))
+			}
 			c.Set("X-Cache", "MISS")
 			return c.JSON(res)
 		})
@@ -173,24 +183,11 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 				logrus.Errorf("Ratelimiter error during %s query: %s", locEngine.Name(), err)
 			}
 
-			res, err := locEngine.SearchImage(q)
-
-			if err != nil && len(res) > 0 {
-				logrus.Warnf("Partial results returned from %s image search despite error: %s", locEngine.Name(), err)
-				c.Status(503)
-				return c.JSON(res)
-			}
-
-			if err != nil {
-				switch err {
-				case ErrCaptcha:
-					err = fmt.Errorf("captcha found, please stop sending requests for a while: %s", err)
-				case ErrSearchTimeout:
-					err = fmt.Errorf("%s", err)
-				}
-
-				logrus.Errorf("Error during %s image search: %s", locEngine.Name(), err)
-				return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
+			// Use resilient image search: retry + circuit breaker + engine fallback
+			res, usedEngine, searchErr := serv.resilient.SearchImage(locEngine, q)
+			if searchErr != nil {
+				logrus.Errorf("Error during resilient %s image search: %s", locEngine.Name(), searchErr)
+				return fiber.NewError(fiber.StatusServiceUnavailable, searchErr.Error())
 			}
 
 			// Store in cache
@@ -201,7 +198,12 @@ func NewServerWithOptions(host string, port int, opts ServerOptions, searchEngin
 				}
 			}
 
-			logrus.Infof("Successfully completed SERP image search using [%s], returned %d results", locEngine.Name(), len(res))
+			if usedEngine != locEngine.Name() {
+				c.Set("X-Fallback-Engine", usedEngine)
+				logrus.Infof("Image request for %s was served by fallback engine: %s (%d results)", locEngine.Name(), usedEngine, len(res))
+			} else {
+				logrus.Infof("Successfully completed SERP image search using [%s], returned %d results", locEngine.Name(), len(res))
+			}
 			c.Set("X-Cache", "MISS")
 			return c.JSON(res)
 		})
@@ -246,6 +248,22 @@ func (s *Server) handleHealthCheck(c *fiber.Ctx) error {
 			status = "not_initialized"
 			overallStatus = "degraded"
 		}
+
+		// Check circuit breaker state
+		circuitState := "closed"
+		if s.resilient != nil {
+			for _, cbStat := range s.resilient.GetCircuitBreakerStats() {
+				if cbStat["engine"] == engine.Name() {
+					circuitState = cbStat["state"].(string)
+					if circuitState == "open" {
+						status = "circuit_open"
+						overallStatus = "degraded"
+					}
+					break
+				}
+			}
+		}
+
 		engines = append(engines, EngineHealth{
 			Name:        engine.Name(),
 			Initialized: engine.IsInitialized(),
@@ -329,8 +347,13 @@ func (s *Server) handleMegaSearch(c *fiber.Ctx) error {
 	}
 	logrus.Infof("Starting SERP megasearch request using engines: %s for query: %s", strings.Join(engineNames, ", "), q.Text)
 
-	// Execute searches in parallel across selected engines
-	results := s.searchSelectedEngines(q, enginesToUse)
+	// Execute searches in parallel across selected engines with resilience
+	var results []MegaSearchResult
+	if s.resilient != nil {
+		results = s.resilient.SearchAllParallel(q, enginesToUse)
+	} else {
+		results = s.searchSelectedEngines(q, enginesToUse)
+	}
 
 	// Deduplicate results while preserving engine information
 	dedupedResults := s.deduplicateMegaResults(results)
@@ -380,8 +403,13 @@ func (s *Server) handleMegaImage(c *fiber.Ctx) error {
 	}
 	logrus.Infof("Starting SERP megasearch image request using engines: %s for query: %s", strings.Join(engineNames, ", "), q.Text)
 
-	// Execute image searches in parallel across selected engines
-	results := s.searchSelectedEnginesImage(q, enginesToUse)
+	// Execute image searches in parallel across selected engines with resilience
+	var results []MegaSearchResult
+	if s.resilient != nil {
+		results = s.resilient.SearchAllImageParallel(q, enginesToUse)
+	} else {
+		results = s.searchSelectedEnginesImage(q, enginesToUse)
+	}
 
 	// Deduplicate results while preserving engine information
 	dedupedResults := s.deduplicateMegaResults(results)
@@ -395,16 +423,43 @@ func (s *Server) handleListEngines(c *fiber.Ctx) error {
 	var engines []map[string]interface{}
 
 	for _, engine := range s.searchEngines {
-		engines = append(engines, map[string]interface{}{
+		engineInfo := map[string]interface{}{
 			"name":        engine.Name(),
 			"initialized": engine.IsInitialized(),
-		})
+		}
+
+		// Add circuit breaker state if resilient searcher is available
+		if s.resilient != nil {
+			for _, cbStat := range s.resilient.GetCircuitBreakerStats() {
+				if cbStat["engine"] == engine.Name() {
+					engineInfo["circuit_state"] = cbStat["state"]
+					break
+				}
+			}
+		}
+
+		engines = append(engines, engineInfo)
 	}
 
 	return c.JSON(map[string]interface{}{
 		"engines": engines,
 		"total":   len(engines),
 	})
+}
+
+// handleResilienceStats returns circuit breaker stats and proxy pool status
+func (s *Server) handleResilienceStats(c *fiber.Ctx) error {
+	stats := map[string]interface{}{
+		"circuit_breakers": s.resilient.GetCircuitBreakerStats(),
+	}
+
+	if pool := s.resilient.GetProxyPool(); pool != nil {
+		stats["proxy_pool"] = pool.Stats()
+	} else {
+		stats["proxy_pool"] = map[string]string{"status": "no proxies configured"}
+	}
+
+	return c.JSON(stats)
 }
 
 // searchSelectedEngines performs parallel searches across selected engines

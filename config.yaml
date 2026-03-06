@@ -12,6 +12,12 @@ app:
   cache_ttl: 300        # Cache TTL in seconds (0 to disable)
   cache_max_size: 1000  # Maximum number of cached responses
   cors: true            # Enable CORS headers for browser clients
+  max_retries: 3        # Max retry attempts per search engine (0 to disable)
+  cb_failures: 5        # Consecutive failures before circuit breaker opens
+  cb_recovery: 60       # Seconds before retrying an engine with open circuit
+  # proxy_list:         # List of proxy URLs for rotation (uncomment and add)
+  #   - socks5://proxy1:1080
+  #   - http://proxy2:8080
 
 2captcha:
   apikey: "123123123123123"
